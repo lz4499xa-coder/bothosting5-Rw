@@ -124,18 +124,44 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
     lines.append(f"⏱️ 登录时间: {now}")
     return "\n".join(lines)
 
+# 检查 Turnstile 是否已通过（单次快速检查，不刷屏）
+def is_turnstile_passed(sb) -> bool:
+    try:
+        status = sb.execute_script("""
+            // 1. 检查 cf-turnstile-response 隐藏 input 是否有值
+            const inputs = document.querySelectorAll('[name="cf-turnstile-response"], input[id*="cf-chl-widget"]');
+            for (const inp of inputs) {
+                if (inp.value && inp.value.length > 10) return 'TOKEN_OK';
+            }
+            // 2. 检查弹窗内的 'Renew for 4 days' 按钮是否已存在且未处于 disabled 状态
+            const btns = Array.from(document.querySelectorAll('button'));
+            const renewBtn = btns.find(b => b.textContent && b.textContent.includes('Renew for 4 days'));
+            if (renewBtn) {
+                const isDisabled = renewBtn.disabled || 
+                                   renewBtn.hasAttribute('disabled') || 
+                                   renewBtn.getAttribute('aria-disabled') === 'true' ||
+                                   renewBtn.classList.contains('disabled');
+                if (!isDisabled) return 'BTN_ENABLED';
+            }
+            return '';
+        """)
+        if status == 'TOKEN_OK':
+            print("✅ Turnstile 验证已通过 (已获取 Token)")
+            return True
+        elif status == 'BTN_ENABLED':
+            print("✅ Turnstile 验证已通过 (续期按钮已激活)")
+            return True
+    except Exception:
+        pass
+    return False
+
 # 等待Turnstile验证通过
-def wait_for_turnstile_pass(sb, timeout=30):
+def wait_for_turnstile_pass(sb, timeout=15):
     start = time.time()
-    cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
     while time.time() - start < timeout:
-        page_lower = sb.get_page_source().lower()
-        if not any(x in page_lower for x in cf_indicators):
-            print("✅ Turnstile 验证已通过")
-            # sb.save_screenshot("turnstile_passed.png")
+        if is_turnstile_passed(sb):
             return True
         sb.sleep(1)
-    print("❌ Turnstile 验证超时未通过")
     return False
     
 # 获取当前出口ip
@@ -173,11 +199,9 @@ def extract_expiry_date(page_source: str) -> str:
         match = re.search(pattern, page_source)
         if match:
             date_str = match.group(1)
-            # 如果是 MM/DD/YYYY 格式，转换为 YYYY/MM/DD
-            if len(date_str.split('/')[-1]) == 4:  # 年份长度4
+            if len(date_str.split('/')[-1]) == 4:
                 parts = date_str.split('/')
-                if len(parts[0]) == 2:  # 第一部分是2位（月）
-                    # 修正：将 MM/DD/YYYY 转为 YYYY/MM/DD
+                if len(parts[0]) == 2:
                     return f"{parts[2]}/{parts[0]}/{parts[1]}"
             return date_str
     return None
@@ -258,7 +282,6 @@ def discord_authorize(state: str) -> str:
         },
     })
 
-    # 如果配置了代理，Discord API 请求也走代理
     proxies = None
     _is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
@@ -362,6 +385,12 @@ def main():
     global _LOGIN_METHOD
 
     with SB(**sb_kwargs) as sb:
+        # 强制设置大窗口尺寸，防止在 xvfb 默认小分辨率下弹窗偏移导致点不到 Turnstile
+        try:
+            sb.set_window_size(1920, 1080)
+        except Exception:
+            pass
+
         try:
             ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
             print(f"📍 当前出口IP: {ip}")
@@ -373,8 +402,8 @@ def main():
         # 方式1: SESSION_TOKEN Cookie 登录（默认）
         if SESSION_TOKEN:
             print("🚀 启动浏览器...")
-            sb.open("https://bot-hosting.net/")
-            sb.wait_for_ready_state_complete()
+            # 必须使用 uc_open_with_reconnect 隐藏 WebDriver 特征
+            sb.uc_open_with_reconnect("https://bot-hosting.net/", reconnect_time=3)
             sb.sleep(2)
 
             print("📝 注入 Cookie...")
@@ -383,8 +412,7 @@ def main():
                     sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
 
             print("🌐 访问 https://bot-hosting.net/a/billings ...")
-            sb.open("https://bot-hosting.net/a/billings")
-            sb.wait_for_ready_state_complete()
+            sb.uc_open_with_reconnect("https://bot-hosting.net/a/billings", reconnect_time=4)
             sb.sleep(3)
             current_url = sb.get_current_url()
             current_title = sb.get_title()
@@ -402,8 +430,7 @@ def main():
             print("\n🔄 SESSION_TOKEN 登录失败或未配置，尝试 Discord OAuth 登录...")
             if do_discord_login(sb):
                 print("🌐 访问 https://bot-hosting.net/a/billings ...")
-                sb.open("https://bot-hosting.net/a/billings")
-                sb.wait_for_ready_state_complete()
+                sb.uc_open_with_reconnect("https://bot-hosting.net/a/billings", reconnect_time=4)
                 sb.sleep(3)
                 current_url = sb.get_current_url()
                 current_title = sb.get_title()
@@ -462,7 +489,7 @@ def main():
                         outer_renew_selector = selector
                         print(f"✅ 续期按钮可用: '{button_text}'")
                         break
-            except Exception as e:
+            except Exception:
                 pass
 
         # 点击外部续期按钮等待弹窗
@@ -470,8 +497,12 @@ def main():
             print("🔄 点击外部续期按钮，等待验证窗口...")
             try:
                 sb.sleep(2)
-                sb.click(outer_renew_selector)
-                sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
+                # 使用 uc_click 避免点击时暴露 WebDriver 痕迹
+                try:
+                    sb.uc_click(outer_renew_selector, reconnect_time=4)
+                except Exception:
+                    sb.click(outer_renew_selector)
+                sb.sleep(10)  # 等待模态框和 Turnstile iframe 加载
             except Exception as e:
                 print(f"❌ 点击外部按钮失败: {e}")
                 send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
@@ -480,43 +511,61 @@ def main():
             # 处理弹窗中的 Turnstile
             print("🔒 检测弹窗中的 Turnstile 验证...")
             turnstile_passed = False
-            for attempt in range(1, 4):
-                try:
-                    sb.uc_gui_click_captcha()
-                    time.sleep(12)
-                except Exception as e:
-                    print(f"⚠️ 点击 Turnstile 出错: {e}")
 
-                if wait_for_turnstile_pass(sb, timeout=20):
-                    turnstile_passed = True
-                    break
-                else:
-                    print(f"⏳ 第 {attempt} 次未通过，重试点击...")
+            # 先静默等待 5 秒看是否已经自动无感通过
+            if wait_for_turnstile_pass(sb, timeout=5):
+                turnstile_passed = True
 
             if not turnstile_passed:
-                print("❌ Turnstile 验证最终未通过，脚本退出")
-                send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
-                return
+                for attempt in range(1, 5):
+                    try:
+                        print(f"🖱️ 尝试点击 Turnstile 验证框 (第 {attempt} 次)...")
+                        # 奇数次使用 GUI 物理点击，偶数次尝试 handle_captcha
+                        if attempt % 2 == 1:
+                            sb.uc_gui_click_captcha()
+                        else:
+                            sb.uc_gui_handle_captcha()
+                    except Exception as e:
+                        print(f"⚠️ 点击 Turnstile 出错: {e}")
+
+                    if wait_for_turnstile_pass(sb, timeout=12):
+                        turnstile_passed = True
+                        break
+                    else:
+                        print(f"⏳ 第 {attempt} 次验证未完成，准备重试...")
+
+            if not turnstile_passed:
+                print("⚠️ 未检测到常规通过标志，尝试兜底直接点击续期按钮...")
 
             # 点击续期按钮
             print("⏳ 等待续期按钮可用并点击...")
-            time.sleep(5) 
+            time.sleep(2)
 
             modal_button_clicked = False
             try:
-                sb.click('button:contains("Renew for 4 days")', timeout=8)
+                sb.wait_for_element_visible('button:contains("Renew for 4 days")', timeout=8)
+                sb.click('button:contains("Renew for 4 days")')
                 modal_button_clicked = True
                 print("✅ 已点击续期按钮")
             except Exception as e:
-                print(f"续期按钮点击失败: {e}")
+                print(f"❌ 续期按钮点击失败: {e}")
 
             print("⏳ 等待新的过期时间...")
-            sb.sleep(6)
+            sb.sleep(10)
 
-            # 提取新的到期日期和倒计时
+            # 提取新的到期日期和倒计时（若首次未检测到变化，主动刷新页面再试一次）
             new_page_text = sb.get_page_source()
             new_expiry = extract_expiry_date(new_page_text)
             new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
+
+            if not new_match and (not new_expiry or new_expiry == current_expiry):
+                print("🔄 页面状态暂未刷新，重新加载账单页确认结果...")
+                sb.uc_open_with_reconnect("https://bot-hosting.net/a/billings", reconnect_time=4)
+                sb.sleep(5)
+                new_page_text = sb.get_page_source()
+                new_expiry = extract_expiry_date(new_page_text)
+                new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
+
             if new_match:
                 new_countdown = new_match.group(1)
                 print(f"✅ 续期成功！新的倒计时: {new_countdown}")
@@ -540,14 +589,24 @@ def main():
                         )
                     )
                 else:
-                    print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
-                    send_telegram_message(
-                        format_notification(
-                            "⚠️ 续期可能未成功",
-                            extra="请登录后台检查",
-                            expiry_date=current_expiry or "（未获取到）"
+                    if not turnstile_passed:
+                        print("❌ Turnstile 验证未通过且续期未生效，建议更换 NODE_LINK 代理节点")
+                        send_telegram_message(
+                            format_notification(
+                                "❌ 续期失败",
+                                error="Turnstile 人机验证被拦截，建议更换更干净的代理节点",
+                                expiry_date=current_expiry or "（未获取到）"
+                            )
                         )
-                    )
+                    else:
+                        print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
+                        send_telegram_message(
+                            format_notification(
+                                "⚠️ 续期可能未成功",
+                                extra="请登录后台检查",
+                                expiry_date=current_expiry or "（未获取到）"
+                            )
+                        )
 
         else:
             if countdown_text:
